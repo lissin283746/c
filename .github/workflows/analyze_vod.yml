@@ -1,0 +1,349 @@
+name: Analyze Twitch VOD
+
+on:
+  workflow_dispatch:
+    inputs:
+      vod_url:
+        description: 'URL do VOD (Twitch, YouTube, etc)'
+        required: true
+        default: 'https://www.twitch.tv/videos/2729982571'
+      language:
+        description: 'Idioma do áudio (pt, en, es...)'
+        required: false
+        default: 'pt'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── 2. Python ──────────────────────────────────────────────────
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Cache modelos (evita re-download a cada run) ────────────
+      - name: Cache Whisper + CLIP models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/whisper
+            ~/.cache/huggingface
+            /tmp/clip_cache
+          key: models-whisper-small-clip-vitb32-v1
+
+      # ── 4. Dependências do sistema ─────────────────────────────────
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg aria2 pigz
+
+      # ── 5. Dependências Python ─────────────────────────────────────
+      - name: Install Python deps
+        run: |
+          pip install --quiet --upgrade pip
+          pip install --quiet \
+            yt-dlp \
+            openai-whisper \
+            torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
+            ftfy regex tqdm pillow
+          pip install --quiet git+https://github.com/openai/CLIP.git
+
+      # ── 6. Download do VOD (máxima velocidade) ────────────────────
+      # Técnicas usadas:
+      #   --concurrent-fragments 16  → baixa 16 fragmentos em paralelo
+      #   --http-chunk-size 10M      → chunks maiores por request
+      #   --buffer-size 16K          → buffer de rede maior
+      #   --no-part                  → sem arquivo .part intermediário
+      #   720p                       → qualidade suficiente para CLIP, download ~2x mais rápido que 1080p
+      - name: Download VOD (fast)
+        run: |
+          yt-dlp \
+            --concurrent-fragments 16 \
+            --http-chunk-size 10M \
+            --buffer-size 16K \
+            --no-part \
+            --retries 10 \
+            --fragment-retries 10 \
+            --abort-on-unavailable-fragment \
+            -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+            --merge-output-format mp4 \
+            -o "vod.mp4" \
+            "${{ github.event.inputs.vod_url }}"
+
+          # Info básica do arquivo
+          echo "=== VOD info ==="
+          ls -lh vod.mp4
+          ffprobe -v quiet -print_format json -show_format vod.mp4 | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)['format']
+          dur=float(d.get('duration',0))
+          print(f'Duração: {int(dur//3600)}h {int((dur%3600)//60)}m {int(dur%60)}s')
+          print(f'Tamanho: {float(d.get(\"size\",0))/1024/1024:.1f} MB')
+          "
+
+      # ── 7. Transcrição com Whisper ─────────────────────────────────
+      - name: Transcribe with Whisper (small)
+        run: |
+          python3 - <<'PYEOF'
+          import whisper, json, os, time
+
+          print("Carregando modelo Whisper small...")
+          model = whisper.load_model("small")
+
+          print("Iniciando transcrição...")
+          t0 = time.time()
+          result = model.transcribe(
+              "vod.mp4",
+              language="${{ github.event.inputs.language }}",
+              verbose=False,
+              fp16=False,           # CPU não suporta fp16
+              condition_on_previous_text=True,
+              temperature=0.0,      # mais determinístico
+              best_of=1,
+              beam_size=1           # mais rápido; troque por 5 para mais qualidade
+          )
+          elapsed = time.time() - t0
+          print(f"Transcrição concluída em {elapsed/60:.1f} min")
+
+          # Salva com timestamps
+          with open("transcription.txt", "w", encoding="utf-8") as f:
+              f.write("=== TRANSCRIÇÃO (Whisper Small) ===\n\n")
+              for seg in result["segments"]:
+                  s = seg["start"]
+                  e = seg["end"]
+                  text = seg["text"].strip()
+                  mins_s = int(s // 60)
+                  secs_s = int(s % 60)
+                  mins_e = int(e // 60)
+                  secs_e = int(e % 60)
+                  f.write(f"[{mins_s:02d}:{secs_s:02d} -> {mins_e:02d}:{secs_e:02d}] {text}\n")
+
+          # Salva também texto puro (sem timestamps) para o Qwen
+          with open("transcription_plain.txt", "w", encoding="utf-8") as f:
+              f.write(result["text"])
+
+          print(f"Segmentos gerados: {len(result['segments'])}")
+          PYEOF
+
+      # ── 8. Análise visual com CLIP ─────────────────────────────────
+      - name: Analyze frames with CLIP (1 frame / 3s)
+        run: |
+          python3 - <<'PYEOF'
+          import torch, clip, os, json, time, subprocess
+          from PIL import Image
+
+          # Extrai frames: 1 a cada 3 segundos
+          os.makedirs("frames", exist_ok=True)
+          print("Extraindo frames (1/3s)...")
+          subprocess.run([
+              "ffmpeg", "-i", "vod.mp4",
+              "-vf", "fps=1/3,scale=336:336:force_original_aspect_ratio=decrease,pad=336:336:(ow-iw)/2:(oh-ih)/2",
+              "-q:v", "3",
+              "-threads", "2",
+              "frames/frame_%06d.jpg"
+          ], check=True, capture_output=True)
+
+          frames = sorted(os.listdir("frames"))
+          print(f"Frames extraídos: {len(frames)}")
+
+          # Carrega CLIP
+          print("Carregando CLIP ViT-B/32...")
+          device = "cpu"
+          model, preprocess = clip.load("ViT-B/32", device=device)
+          model.eval()
+
+          # Queries de destaque — personalize conforme o conteúdo da live
+          queries = [
+              "exciting highlight moment",
+              "funny or comedy moment",
+              "crowd or audience reaction",
+              "celebration or victory",
+              "fail or mistake or accident",
+              "emotional or intense moment",
+              "fight or confrontation",
+              "boring quiet calm scene",
+              "gameplay action sequence",
+              "streamer talking to camera"
+          ]
+
+          HIGHLIGHT_QUERIES = {
+              "exciting highlight moment",
+              "funny or comedy moment",
+              "crowd or audience reaction",
+              "celebration or victory",
+              "fail or mistake or accident",
+              "emotional or intense moment",
+              "fight or confrontation",
+              "gameplay action sequence",
+          }
+
+          HIGHLIGHT_THRESHOLD = 0.14
+
+          print("Codificando queries de texto...")
+          with torch.no_grad():
+              text_inputs = clip.tokenize(queries).to(device)
+              text_features = model.encode_text(text_inputs)
+              text_features /= text_features.norm(dim=-1, keepdim=True)
+
+          results = []
+          t0 = time.time()
+
+          print("Analisando frames com CLIP...")
+          for i, fname in enumerate(frames):
+              timestamp = i * 3  # segundos
+              try:
+                  img = preprocess(Image.open(f"frames/{fname}").convert("RGB")).unsqueeze(0).to(device)
+                  with torch.no_grad():
+                      img_features = model.encode_image(img)
+                      img_features /= img_features.norm(dim=-1, keepdim=True)
+                      sims = (100.0 * img_features @ text_features.T).softmax(dim=-1)[0]
+
+                  scores = {q: float(sims[j]) for j, q in enumerate(queries)}
+                  top_q = max(scores, key=scores.get)
+                  top_s = scores[top_q]
+
+                  results.append({
+                      "timestamp": timestamp,
+                      "top_query": top_q,
+                      "top_score": round(top_s, 4),
+                      "scores": {k: round(v, 4) for k, v in scores.items()}
+                  })
+
+              except Exception as ex:
+                  print(f"  Erro no frame {i}: {ex}")
+
+              if i % 200 == 0 and i > 0:
+                  elapsed = time.time() - t0
+                  eta = elapsed / i * (len(frames) - i)
+                  print(f"  {i}/{len(frames)} frames | {elapsed/60:.1f}min decorridos | ETA ~{eta/60:.1f}min")
+
+          print(f"CLIP concluído em {(time.time()-t0)/60:.1f} min")
+
+          # ── Salva análise CLIP ──
+          with open("clip_analysis.txt", "w", encoding="utf-8") as f:
+              f.write("=== ANÁLISE VISUAL (CLIP ViT-B/32) ===\n\n")
+
+              # Momentos destaque
+              f.write("--- MOMENTOS DE DESTAQUE (score > {}) ---\n".format(HIGHLIGHT_THRESHOLD))
+              highlights = [
+                  r for r in results
+                  if r["top_query"] in HIGHLIGHT_QUERIES and r["top_score"] > HIGHLIGHT_THRESHOLD
+              ]
+
+              # Agrupa cliques próximos (janela de 30s)
+              clusters = []
+              for h in highlights:
+                  if clusters and h["timestamp"] - clusters[-1][-1]["timestamp"] <= 30:
+                      clusters[-1].append(h)
+                  else:
+                      clusters.append([h])
+
+              for cluster in clusters:
+                  best = max(cluster, key=lambda x: x["top_score"])
+                  t = best["timestamp"]
+                  mins, secs = divmod(t, 60)
+                  hrs, mins = divmod(mins, 60)
+                  f.write(f"  [{hrs:02d}:{mins:02d}:{secs:02d}] {best['top_query']} (score={best['top_score']:.3f})\n")
+
+              f.write(f"\nTotal de clusters de destaque: {len(clusters)}\n")
+
+              # Amostra geral (a cada 30s = a cada 10 frames)
+              f.write("\n--- AMOSTRA GERAL (a cada 30s) ---\n")
+              for r in results[::10]:
+                  t = r["timestamp"]
+                  mins, secs = divmod(t, 60)
+                  hrs, mins = divmod(mins, 60)
+                  f.write(f"  [{hrs:02d}:{mins:02d}:{secs:02d}] {r['top_query']} ({r['top_score']:.3f})\n")
+
+              # JSON completo para pós-processamento
+              f.write("\n--- TOP 5 POR SCORE GERAL ---\n")
+              top5 = sorted(results, key=lambda x: x["top_score"], reverse=True)[:5]
+              for r in top5:
+                  t = r["timestamp"]
+                  mins, secs = divmod(t, 60)
+                  hrs, mins = divmod(mins, 60)
+                  f.write(f"  [{hrs:02d}:{mins:02d}:{secs:02d}] {r['top_query']} (score={r['top_score']:.3f})\n")
+
+          # Salva JSON completo separado
+          with open("clip_raw.json", "w") as f:
+              json.dump(results, f)
+
+          print("Análise CLIP salva!")
+          PYEOF
+
+      # ── 9. Combina tudo em um TXT final para o Qwen ───────────────
+      - name: Combine analysis into final report
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          with open("full_analysis.txt", "w", encoding="utf-8") as out:
+              out.write("=" * 70 + "\n")
+              out.write("RELATÓRIO COMPLETO DE ANÁLISE DE VOD\n")
+              out.write("=" * 70 + "\n")
+              out.write(f"URL: ${{ github.event.inputs.vod_url }}\n")
+              out.write(f"Idioma: ${{ github.event.inputs.language }}\n")
+              out.write("=" * 70 + "\n\n")
+
+              out.write("## INSTRUÇÕES PARA O QWEN\n\n")
+              out.write(
+                  "Com base na transcrição (Whisper) e análise visual (CLIP) abaixo, "
+                  "identifique os melhores momentos para criar clipes do YouTube.\n"
+                  "Para cada clipe sugerido, informe:\n"
+                  "  - Timestamp de início e fim (formato HH:MM:SS)\n"
+                  "  - Título sugerido para o clipe\n"
+                  "  - Motivo (por que é um bom clipe)\n"
+                  "  - Score de relevância estimado (1-10)\n\n"
+              )
+
+              out.write("=" * 70 + "\n")
+              out.write("## TRANSCRIÇÃO (Whisper Small)\n")
+              out.write("=" * 70 + "\n\n")
+              with open("transcription.txt", encoding="utf-8") as f:
+                  out.write(f.read())
+
+              out.write("\n\n")
+              out.write("=" * 70 + "\n")
+              out.write("## ANÁLISE VISUAL (CLIP ViT-B/32)\n")
+              out.write("=" * 70 + "\n\n")
+              with open("clip_analysis.txt", encoding="utf-8") as f:
+                  out.write(f.read())
+
+          size_kb = os.path.getsize("full_analysis.txt") / 1024
+          print(f"Relatório final: {size_kb:.1f} KB")
+          PYEOF
+
+      # ── 10. Upload dos artifacts ───────────────────────────────────
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vod-analysis-${{ github.run_id }}
+          path: |
+            full_analysis.txt
+            transcription.txt
+            transcription_plain.txt
+            clip_analysis.txt
+            clip_raw.json
+          retention-days: 7
+          if-no-files-found: error
+
+      # ── 11. Resumo no job summary ─────────────────────────────────
+      - name: Print summary
+        run: |
+          echo "## ✅ Análise concluída" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Arquivo | Tamanho |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|---------|" >> $GITHUB_STEP_SUMMARY
+          for f in full_analysis.txt transcription.txt clip_analysis.txt clip_raw.json; do
+            size=$(du -sh "$f" 2>/dev/null | cut -f1)
+            echo "| $f | $size |" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Baixe os artifacts acima para enviar ao Qwen." >> $GITHUB_STEP_SUMMARY
