@@ -51,7 +51,7 @@ jobs:
 
           pip install yt-dlp
 
-          pip install openai-whisper ftfy regex tqdm pillow
+          pip install openai-whisper ftfy regex tqdm pillow numpy
 
           pip install torch==2.2.2+cpu torchvision==0.17.2+cpu \
             --index-url https://download.pytorch.org/whl/cpu
